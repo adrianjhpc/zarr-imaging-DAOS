@@ -95,25 +95,27 @@ def ingest_fits_cube(
         root.attrs["fits_header"] = header_cards
         root.attrs["wcs_header_string"] = hdu.header.tostring(sep="\n")
 
+        # Write main image cube with Zarr v3 dimension_names metadata
         img_arr = root.create_array(
             name=var_name,
             shape=shape,
             chunks=chunk_shape,
             dtype=native_dtype,
+            dimension_names=dim_names,
             compressors=[BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")],
         )
-        img_arr.attrs["_ARRAY_DIMENSIONS"] = dim_names
         img_arr.attrs["units"] = hdu.header.get("BUNIT", "Jy/beam")
 
+        # Write 1D coordinate arrays with Zarr v3 dimension_names metadata
         for dim_name, coord_vals in coords.items():
             c_arr = root.create_array(
                 name=dim_name,
                 shape=coord_vals.shape,
                 chunks=coord_vals.shape,
                 dtype=coord_vals.dtype,
+                dimension_names=[dim_name],
             )
             c_arr[:] = coord_vals
-            c_arr.attrs["_ARRAY_DIMENSIONS"] = [dim_name]
 
         da.to_zarr(dask_data, img_arr)
 

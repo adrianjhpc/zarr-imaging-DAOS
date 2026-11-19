@@ -92,9 +92,9 @@ def ingest_mri_volume(
             shape=current_arr.shape,
             chunks=level_chunks,
             dtype=dtype,
+            dimension_names=dim_names,
             compressors=[BloscCodec(cname="zstd", clevel=3, shuffle="shuffle")],
         )
-        z_arr.attrs["_ARRAY_DIMENSIONS"] = dim_names
 
         for dim, size, base_step in zip(dim_names, current_arr.shape, voxel_sizes):
             step = base_step * scale_factor if dim in ("z", "y", "x") else base_step
@@ -104,9 +104,9 @@ def ingest_mri_volume(
                 shape=coord_vals.shape,
                 chunks=coord_vals.shape,
                 dtype=np.float64,
+                dimension_names=[dim],
             )
             c_arr[:] = coord_vals
-            c_arr.attrs["_ARRAY_DIMENSIONS"] = [dim]
 
         da.to_zarr(current_arr.rechunk(level_chunks), z_arr)
 
@@ -140,7 +140,7 @@ def ingest_mri_volume(
     ]
 
     zarr.consolidate_metadata(store)
-    return xr.open_datatree(store=store, engine="zarr", consolidated=True)
+    return xr.open_datatree(store, engine="zarr", consolidated=True)
 
 
 @xr.register_dataset_accessor("mri")
