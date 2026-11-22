@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import asyncio
+import json
 import dask.array as da
 import numpy as np
 import xarray as xr
@@ -11,8 +13,8 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from zarr.codecs import BloscCodec
 from zarr.abc.store import Store
-from zarr_daos.store import DAOSStore
-
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.sync import sync
 
 def _extract_fits_coordinates(
     header: fits.Header, shape: tuple[int, ...]
@@ -63,13 +65,75 @@ def _default_radio_chunks(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(min(512, s) for s in shape)
 
 
+async def _write_fits_coords_and_root_async(
+    store: Store,
+    coords: dict[str, np.ndarray],
+    img_meta: dict[str, Any],
+    var_name: str,
+    root_attrs: dict[str, Any],
+) -> None:
+    proto = default_buffer_prototype()
+    kv_pairs: list[tuple[str, Any]] = []
+    consolidated: dict[str, Any] = {var_name: img_meta}
+
+    for dim_name, coord_vals in coords.items():
+        arr_le = np.ascontiguousarray(coord_vals, dtype=coord_vals.dtype.newbyteorder("<"))
+        n = int(arr_le.shape[0])
+        meta: dict[str, Any] = {
+            "shape": [n],
+            "data_type": str(arr_le.dtype),
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": {"chunk_shape": [n]},
+            },
+            "chunk_key_encoding": {
+                "name": "default",
+                "configuration": {"separator": "/"},
+            },
+            "fill_value": 0.0 if np.issubdtype(arr_le.dtype, np.floating) else 0,
+            "codecs": [
+                {"name": "bytes", "configuration": {"endian": "little"}},
+            ],
+            "attributes": {},
+            "zarr_format": 3,
+            "node_type": "array",
+            "dimension_names": [dim_name],
+        }
+        consolidated[dim_name] = meta
+        meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        kv_pairs.append((f"{dim_name}/zarr.json", proto.buffer.from_bytes(meta_bytes)))
+        kv_pairs.append((f"{dim_name}/c/0", proto.buffer.from_bytes(arr_le.tobytes())))
+
+    root_meta: dict[str, Any] = {
+        "zarr_format": 3,
+        "node_type": "group",
+        "attributes": root_attrs,
+        "consolidated_metadata": {
+            "kind": "inline",
+            "must_understand": False,
+            "metadata": consolidated,
+        },
+    }
+    kv_pairs.append(
+        ("zarr.json", proto.buffer.from_bytes(json.dumps(root_meta, separators=(",", ":")).encode("utf-8")))
+    )
+
+    if hasattr(store, "set_many"):
+        await store.set_many(kv_pairs)
+    elif hasattr(store, "_set_many"):
+        await store._set_many(kv_pairs)
+    else:
+        await asyncio.gather(*(store.set(k, v) for k, v in kv_pairs))
+
+
 def ingest_fits_cube(
     fits_path: str | Path,
-    store: DAOSStore | Store | str,
+    store: Store | str,
     *,
     hdu_index: int = 0,
     chunks: tuple[int, ...] | None = None,
     var_name: str = "SKY",
+    in_memory_limit_bytes: int = 2 * 1024**3,
 ) -> xr.Dataset:
     """Stream a FITS image cube into DAOSStore and return a lazy Xarray Dataset."""
     with fits.open(fits_path, memmap=True) as hdul:
@@ -87,41 +151,46 @@ def ingest_fits_cube(
             for k, v in hdu.header.items()
             if k and k not in ("COMMENT", "HISTORY", "") and isinstance(v, (str, int, float, bool))
         }
+        root_attrs: dict[str, Any] = {
+            "conventions": "xradio-image-v0.1",
+            "fits_header": header_cards,
+            "wcs_header_string": hdu.header.tostring(sep="\n"),
+        }
 
-        dask_data = da.from_array(hdu.data, chunks=chunk_shape).astype(native_dtype)
+        root = zarr.open_group(store=store, mode="a")
 
-        root = zarr.open_group(store=store, mode="w")
-        root.attrs["conventions"] = "xradio-image-v0.1"
-        root.attrs["fits_header"] = header_cards
-        root.attrs["wcs_header_string"] = hdu.header.tostring(sep="\n")
-
-        # Write main image cube with Zarr v3 dimension_names metadata
+        # Write main image cube with attributes in one metadata write
         img_arr = root.create_array(
             name=var_name,
             shape=shape,
             chunks=chunk_shape,
             dtype=native_dtype,
             dimension_names=dim_names,
+            attributes={"units": hdu.header.get("BUNIT", "Jy/beam")},
             compressors=[BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")],
+            overwrite=False,
         )
-        img_arr.attrs["units"] = hdu.header.get("BUNIT", "Jy/beam")
 
-        # Write 1D coordinate arrays with Zarr v3 dimension_names metadata
-        for dim_name, coord_vals in coords.items():
-            c_arr = root.create_array(
-                name=dim_name,
-                shape=coord_vals.shape,
-                chunks=coord_vals.shape,
-                dtype=coord_vals.dtype,
-                dimension_names=[dim_name],
+        # Write all 1D coordinates + consolidated root zarr.json in one set_many batch
+        sync(
+            _write_fits_coords_and_root_async(
+                root.store,
+                coords,
+                img_arr.metadata.to_dict(),
+                var_name,
+                root_attrs,
             )
-            c_arr[:] = coord_vals
+        )
 
-        da.to_zarr(dask_data, img_arr)
+        # Fast path: use Zarr's native async BatchedCodecPipeline when cube fits in memory
+        est_bytes = int(np.prod(shape)) * native_dtype.itemsize
+        if est_bytes <= in_memory_limit_bytes:
+            img_arr[:] = np.ascontiguousarray(hdu.data, dtype=native_dtype)
+        else:
+            dask_data = da.from_array(hdu.data, chunks=chunk_shape).astype(native_dtype)
+            da.to_zarr(dask_data, img_arr)
 
-    zarr.consolidate_metadata(store)
     return xr.open_zarr(store=store, consolidated=True)
-
 
 @xr.register_dataset_accessor("radio")
 class RadioAccessor:

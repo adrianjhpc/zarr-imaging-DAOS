@@ -1,19 +1,36 @@
 from __future__ import annotations
 
+import os
+import uuid
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-import zarr
+import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
+from zarr.abc.store import Store
 from zarr.storage import MemoryStore
 
 from zarr_imaging_daos import ingest_fits_cube, ingest_mri_volume
 
 
-def test_fits_cube_ingestion_and_wcs_accessor(tmp_path: Path) -> None:
-    store = MemoryStore()
+@pytest.fixture(params=["memory", "daos_array"])
+def store(request: pytest.FixtureRequest) -> Store:
+    if request.param == "memory":
+        return MemoryStore()
+
+    pool = os.environ.get("DAOS_POOL")
+    cont = os.environ.get("DAOS_CONT")
+    if not pool or not cont:
+        pytest.skip("Set DAOS_POOL and DAOS_CONT to run DAOSArrayStore integration tests.")
+
+    from zarr_daos.libdaos_store import DAOSArrayStore
+
+    return DAOSArrayStore(pool=pool, cont=cont, prefix=f"img_test_{uuid.uuid4().hex}")
+
+
+def test_fits_cube_ingestion_and_wcs_accessor(tmp_path: Path, store: Store) -> None:
     cube = np.random.default_rng(7).standard_normal((1, 16, 32, 32)).astype(np.float32)
 
     wcs = WCS(naxis=4)
@@ -33,8 +50,7 @@ def test_fits_cube_ingestion_and_wcs_accessor(tmp_path: Path) -> None:
     assert ds.radio.wcs.wcs.ctype[2] == "FREQ"
 
 
-def test_mri_nifti_ingestion_and_pyramid(tmp_path: Path) -> None:
-    store = MemoryStore()
+def test_mri_nifti_ingestion_and_pyramid(tmp_path: Path, store: Store) -> None:
     vol = np.linspace(0, 1000, 64 * 64 * 64, dtype=np.float32).reshape(64, 64, 64)
     affine = np.diag([1.5, 1.5, 2.0, 1.0])
     nifti_file = tmp_path / "sub01_t1w.nii.gz"
@@ -44,7 +60,12 @@ def test_mri_nifti_ingestion_and_pyramid(tmp_path: Path) -> None:
 
     assert dt["0"].ds["image"].shape == (64, 64, 64)
     assert dt["1"].ds["image"].shape == (32, 32, 32)
+    assert dt.attrs["ome"]["version"] == "0.5"
 
     reconstructed = dt["0"].ds.mri.to_nifti()
     np.testing.assert_allclose(reconstructed.get_fdata(), vol)
     np.testing.assert_allclose(reconstructed.affine, affine)
+
+    expected_l1_affine = affine.copy()
+    expected_l1_affine[:3, :3] *= 2.0
+    np.testing.assert_allclose(dt["1"].ds.mri.affine, expected_l1_affine)
