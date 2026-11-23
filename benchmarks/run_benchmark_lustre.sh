@@ -22,6 +22,7 @@ trap cleanup EXIT
 
 
 mkdir -p /newlust/zarr_lustre_tmp
+lfs setstripe -c 1 -S 1M /newlust/zarr_lustre_tmp
 
 NODES=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 NODE_W="${NODES[0]}"
